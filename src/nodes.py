@@ -10,7 +10,7 @@ class MaskToBBSmoothed:
                 "masks": ("MASK",),
                 "images": ("IMAGE",),
                 "resolution": ("INT", {"default": 512, "min": 256, "max": 4096, "step": 64}),
-                "smoothing_factor": ("FLOAT", {"default": 0.03, "min": 0.01, "max": 1.0, "step": 0.01}),
+                "smoothing_factor": ("FLOAT", {"default": 0.05, "min": 0.01, "max": 1.0, "step": 0.01}),
                 "padding": ("INT", {"default": 64, "min": 0, "max": 512, "step": 8}),
             },
         }
@@ -21,103 +21,78 @@ class MaskToBBSmoothed:
     CATEGORY = "Image/Processing"
 
     def process(self, masks, images, resolution, smoothing_factor, padding):
-        # MASK tensor is [B, H, W], IMAGE tensor is [B, H, W, C]
         mask_frames = masks.cpu().numpy()
         img_frames = images.cpu().numpy()
         
         batch_size = min(mask_frames.shape[0], img_frames.shape[0])
         height, width = mask_frames.shape[1], mask_frames.shape[2]
         
-        output_m_crops = []
-        output_bboxes = []
-        output_crops = []
-        
-        prev_bbox = None
+        # --- PASS 1: Calculate Global Aspect Ratio ---
+        all_mask_coords = []
+        ratios = []
+        for i in range(batch_size):
+            m_bin = (mask_frames[i] * 255).astype(np.uint8)
+            contours, _ = cv2.findContours(m_bin, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            if contours:
+                pts = np.concatenate(contours)
+                mx, my, mw, mh = cv2.boundingRect(pts)
+                all_mask_coords.append(np.array([mx, my, mx + mw, my + mh], dtype=np.float32))
+                ratios.append(mw / mh if mh > 0 else 1.0)
+            else:
+                all_mask_coords.append(np.array([width/2-32, height/2-32, width/2+32, height/2+32], dtype=np.float32))
+                ratios.append(1.0)
+
+        global_ratio = sum(ratios)/len(ratios)
+
+        # --- PASS 2: Smooth and Crop ---
+        output_m_crops, output_bboxes, output_crops = [], [], []
+        cam_center, cam_size = None, None
         
         for i in range(batch_size):
-            # 1. Prepare Mask and Detect Contours
-            mask_binary = (mask_frames[i] * 255).astype(np.uint8)
-            contours, _ = cv2.findContours(mask_binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            m_rect = all_mask_coords[i]
+            m_center = np.array([(m_rect[0] + m_rect[2])/2, (m_rect[1] + m_rect[3])/2])
+            m_dim = np.array([m_rect[2] - m_rect[0], m_rect[3] - m_rect[1]])
             
-            if contours:
-                x_min, y_min = width, height
-                x_max, y_max = 0, 0
-                for contour in contours:
-                    x, y, w, h = cv2.boundingRect(contour)
-                    x_min, y_min = min(x_min, x), min(y_min, y)
-                    x_max, y_max = max(x_max, x + w), max(y_max, y + h)
+            target_size_raw = m_dim + (padding * 2)
+            if global_ratio > (target_size_raw[0] / target_size_raw[1]):
+                target_size = np.array([target_size_raw[1] * global_ratio, target_size_raw[1]])
             else:
-                x_min, y_min = width // 2 - 32, height // 2 - 32
-                x_max, y_max = width // 2 + 32, height // 2 + 32
+                target_size = np.array([target_size_raw[0], target_size_raw[0] / global_ratio])
 
-            # 2. Apply Padding
-            x_min, y_min = max(0, x_min - padding), max(0, y_min - padding)
-            x_max, y_max = min(width, x_max + padding), min(height, y_max + padding)
-
-            # 3. Calculate Square BBox (32px aligned)
-            curr_w, curr_h = x_max - x_min, y_max - y_min
-            side = max(curr_w, curr_h)
-            new_side = ((side + 31) // 32) * 32
-            
-            center_x, center_y = (x_min + x_max) // 2, (y_min + y_max) // 2
-            s_x_min, s_y_min = center_x - new_side // 2, center_y - new_side // 2
-            s_x_max, s_y_max = s_x_min + new_side, s_y_min + new_side
-            
-            # Shift back into frame if square exceeds edges
-            if s_x_min < 0:
-                s_x_max -= s_x_min
-                s_x_min = 0
-            if s_y_min < 0:
-                s_y_max -= s_y_min
-                s_y_min = 0
-            if s_x_max > width:
-                s_x_min -= (s_x_max - width)
-                s_x_max = width
-            if s_y_max > height:
-                s_y_min -= (s_y_max - height)
-                s_y_max = height
-
-            s_x_min, s_y_min = max(0, s_x_min), max(0, s_y_min)
-            s_x_max, s_y_max = min(width, s_x_max), min(height, s_y_max)
-
-            # 4. Smoothing
-            curr_coords = np.array([s_x_min, s_y_min, s_x_max, s_y_max])
-            if prev_bbox is None:
-                smoothed_bbox = curr_coords
+            if cam_center is None:
+                cam_center, cam_size = m_center, target_size
             else:
-                smoothed_bbox = prev_bbox * (1 - smoothing_factor) + curr_coords * smoothing_factor
-            
-            prev_bbox = smoothed_bbox
-            sb = smoothed_bbox.astype(int)
-            
-            # 5. BBOX Data (x, y, w, h)
-            output_bboxes.append((sb[0], sb[1], sb[2] - sb[0], sb[3] - sb[1]))
-            
-            # 6. Coordinate clipping for cropping
-            y1, y2, x1, x2 = max(0, sb[1]), min(height, sb[3]), max(0, sb[0]), min(width, sb[2])
+                cam_center = cam_center * (1 - smoothing_factor) + m_center * smoothing_factor
+                cam_size = cam_size * (1 - smoothing_factor*0.5) + target_size * (smoothing_factor*0.5)
 
-            # 7. Square Crop Output (Images)
-            src_frame = (img_frames[i] * 255).astype(np.uint8)
-            crop = src_frame[y1:y2, x1:x2]
-            if crop.size > 0:
-                resized_crop = cv2.resize(crop, (resolution, resolution), interpolation=cv2.INTER_LANCZOS4)
-            else:
-                resized_crop = np.zeros((resolution, resolution, 3), dtype=np.uint8)
-            output_crops.append(resized_crop.astype(np.float32) / 255.0)
+            w_32, h_32 = ((int(cam_size[0]) + 31) // 32) * 32, ((int(cam_size[1]) + 31) // 32) * 32
+            ix1, iy1 = int(max(0, cam_center[0] - w_32//2)), int(max(0, cam_center[1] - h_32//2))
+            
+            ix1 = min(ix1, width - w_32) if width > w_32 else 0
+            iy1 = min(iy1, height - h_32) if height > h_32 else 0
+            ix1, iy1 = max(0, ix1), max(0, iy1)
 
-            # 8. Square Crop Output (Masks)
-            m_crop = mask_binary[y1:y2, x1:x2]
-            if m_crop.size > 0:
-                resized_m_crop = cv2.resize(m_crop, (resolution, resolution), interpolation=cv2.INTER_LINEAR)
-            else:
-                resized_m_crop = np.zeros((resolution, resolution), dtype=np.uint8)
-            output_m_crops.append(resized_m_crop.astype(np.float32) / 255.0)
+            output_bboxes.append((ix1, iy1, w_32, h_32))
+            
+            img_u8 = (img_frames[i] * 255).astype(np.uint8)
+            crop = img_u8[iy1:iy1+h_32, ix1:ix1+w_32]
+            
+            if crop.shape[1] < w_32 or crop.shape[0] < h_32:
+                canvas = np.zeros((h_32, w_32, 3), dtype=np.uint8)
+                canvas[:crop.shape[0], :crop.shape[1]] = crop
+                crop = canvas
 
-        return (
-            torch.from_numpy(np.stack(output_m_crops)), 
-            output_bboxes, 
-            torch.from_numpy(np.stack(output_crops))
-        )
+            output_crops.append(cv2.resize(crop, (resolution, resolution), interpolation=cv2.INTER_AREA).astype(np.float32)/255.0)
+            
+            m_u8 = (mask_frames[i] * 255).astype(np.uint8)
+            m_crop = m_u8[iy1:iy1+h_32, ix1:ix1+w_32]
+            if m_crop.shape[1] < w_32 or m_crop.shape[0] < h_32:
+                m_canvas = np.zeros((h_32, w_32), dtype=np.uint8)
+                m_canvas[:m_crop.shape[0], :m_crop.shape[1]] = m_crop
+                m_crop = m_canvas
+            output_m_crops.append(cv2.resize(m_crop, (resolution, resolution), interpolation=cv2.INTER_LINEAR).astype(np.float32)/255.0)
+
+        return (torch.from_numpy(np.stack(output_m_crops)), output_bboxes, torch.from_numpy(np.stack(output_crops)))
 
 class MaskBBoxStitcher:
     @classmethod
@@ -125,9 +100,10 @@ class MaskBBoxStitcher:
         return {
             "required": {
                 "original_images": ("IMAGE",),
-                "processed_images": ("IMAGE",), # Renamed for clarity
+                "processed_images": ("IMAGE",),
+                "cropped_masks": ("MASK",),
                 "bboxes": ("BBOX",),
-                "feathering": ("INT", {"default": 0, "min": 0, "max": 128, "step": 1}),
+                "feathering": ("INT", {"default": 10, "min": 0, "max": 128, "step": 1}),
             },
         }
 
@@ -135,39 +111,36 @@ class MaskBBoxStitcher:
     FUNCTION = "stitch"
     CATEGORY = "Image/Processing"
 
-    def stitch(self, original_images, processed_images, bboxes, feathering):
-        orig_frames = original_images.cpu().numpy()
-        proc_frames = processed_images.cpu().numpy()
+    def stitch(self, original_images, processed_images, cropped_masks, bboxes, feathering):
+        orig = original_images.cpu().numpy()
+        proc = processed_images.cpu().numpy()
+        masks = cropped_masks.cpu().numpy()
         
-        batch_size = min(orig_frames.shape[0], proc_frames.shape[0], len(bboxes))
         out_frames = []
-
-        for i in range(batch_size):
-            orig_img = (orig_frames[i] * 255).astype(np.uint8)
-            proc_img = (proc_frames[i] * 255).astype(np.uint8)
+        for i in range(min(len(orig), len(proc))):
+            canvas = (orig[i] * 255).astype(np.uint8)
             x, y, w, h = bboxes[i]
-
-            if w <= 0 or h <= 0:
-                out_frames.append(orig_frames[i])
-                continue
-
-            # Resize processed crop back to original bbox size
-            resized_crop = cv2.resize(proc_img, (w, h), interpolation=cv2.INTER_LANCZOS4)
-
+            pi = (proc[i] * 255).astype(np.uint8)
+            mi = (masks[i] * 255).astype(np.uint8)
+            
+            # --- SUB-PIXEL ALIGNMENT ---
+            src_pts = np.float32([[0, 0], [pi.shape[1]-1, 0], [0, pi.shape[0]-1]])
+            dst_pts = np.float32([[x, y], [x + w - 1, y], [x, y + h - 1]])
+            matrix = cv2.getAffineTransform(src_pts, dst_pts)
+            
+            # Warp both image and mask back to full resolution space
+            warped_proc = cv2.warpAffine(pi, matrix, (canvas.shape[1], canvas.shape[0]), flags=cv2.INTER_CUBIC)
+            warped_mask = cv2.warpAffine(mi, matrix, (canvas.shape[1], canvas.shape[0]), flags=cv2.INTER_LINEAR)
+            
+            alpha = warped_mask.astype(np.float32) / 255.0
+            
             if feathering > 0:
-                mask = np.ones((h, w), dtype=np.uint8) * 255
-                feather_size = max(3, feathering if feathering % 2 != 0 else feathering + 1)
-                mask = cv2.copyMakeBorder(mask, 10, 10, 10, 10, cv2.BORDER_CONSTANT, value=0)
-                mask = cv2.GaussianBlur(mask, (feather_size, feather_size), 0)
-                mask = mask[10:-10, 10:-10][:, :, np.newaxis] / 255.0
-
-                roi = orig_img[y:y+h, x:x+w]
-                blended_roi = (resized_crop * mask + roi * (1 - mask)).astype(np.uint8)
-                orig_img[y:y+h, x:x+w] = blended_roi
-            else:
-                orig_img[y:y+h, x:x+w] = resized_crop
-
-            out_frames.append(orig_img.astype(np.float32) / 255.0)
+                f = feathering * 2 + 1
+                alpha = cv2.GaussianBlur(alpha, (f, f), 0)
+            
+            alpha = np.expand_dims(alpha, axis=-1)
+            blended = (warped_proc.astype(np.float32) * alpha + canvas.astype(np.float32) * (1.0 - alpha))
+            out_frames.append(blended.astype(np.uint8).astype(np.float32) / 255.0)
 
         return (torch.from_numpy(np.stack(out_frames)),)
 
