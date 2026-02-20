@@ -70,45 +70,41 @@ class MaskToBBSmoothed:
                 cam_center = cam_center * (1 - smoothing_factor) + m_center * smoothing_factor
                 cam_size = cam_size * (1 - smoothing_factor * 0.2) + target_size * (smoothing_factor * 0.2)
 
-            # --- CLAMPING LOGIC ---
             hw, hh = cam_size[0]/2, cam_size[1]/2
-            
-            # 1. Start with ideal floating point corners
             f_x1, f_y1 = cam_center[0] - hw, cam_center[1] - hh
             f_x2, f_y2 = cam_center[0] + hw, cam_center[1] + hh
             
-            # 2. Force the box to stay within the frame dimensions [0,0,W,H]
-            # This prevents the box from "peeking" into the void
+            # Boundary Clamping
             if f_x1 < 0:
-                f_x2 -= f_x1 # Shift the whole box right
+                f_x2 -= f_x1
                 f_x1 = 0.0
             if f_y1 < 0:
-                f_y2 -= f_y1 # Shift the whole box down
+                f_y2 -= f_y1
                 f_y1 = 0.0
             if f_x2 > width:
-                f_x1 -= (f_x2 - width) # Shift left
+                f_x1 -= (f_x2 - width)
                 f_x2 = float(width)
             if f_y2 > height:
-                f_y1 -= (f_y2 - height) # Shift up
+                f_y1 -= (f_y2 - height)
                 f_y2 = float(height)
 
-            # Final size in case the box is larger than the image itself
             f_w, f_h = f_x2 - f_x1, f_y2 - f_y1
-
             output_bboxes.append((f_x1, f_y1, f_w, f_h))
             
+            # --- MODIFIED: Ensure Resolution is an even multiple of 32 (Divisible by 64) ---
             if global_target_ratio > 1:
                 tw, th = resolution, int(resolution / global_target_ratio)
             else:
                 th, tw = resolution, int(resolution * global_target_ratio)
-            tw, th = (tw // 32) * 32, (th // 32) * 32 
+            
+            # Rounding to 64 ensures (Res / 32) is always an EVEN number
+            tw, th = (max(64, tw + 31) // 64) * 64, (max(64, th + 31) // 64) * 64 
 
             src_pts = np.float32([[f_x1, f_y1], [f_x1 + f_w, f_y1], [f_x1, f_y1 + f_h], [f_x1 + f_w, f_y1 + f_h]])
             dst_pts = np.float32([[0, 0], [tw, 0], [0, th], [tw, th]])
             M = cv2.getPerspectiveTransform(src_pts, dst_pts)
             
             img_u8 = (img_frames[i] * 255).astype(np.uint8)
-            # Use BORDER_CONSTANT here because clamping should ensure we never actually hit the border anyway
             crop = cv2.warpPerspective(img_u8, M, (tw, th), flags=cv2.INTER_LANCZOS4, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
             output_crops.append(crop.astype(np.float32)/255.0)
             
@@ -152,13 +148,11 @@ class MaskBBoxStitcher:
             dst_pts = np.float32([[fx, fy], [fx + fw, fy], [fx, fy + fh], [fx + fw, fy + fh]])
             M = cv2.getPerspectiveTransform(src_pts, dst_pts)
             
-            # Since clamping ensures we stay in-frame, BORDER_CONSTANT is safe and prevents edge artifacts
             ai_warped = cv2.warpPerspective(pi, M, (w, h), flags=cv2.INTER_CUBIC, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
             mask_warped = cv2.warpPerspective(mi, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
             
-            # Safe zone inset is still useful for cleaning up interpolation boundaries
             safe_mask = np.zeros((h, w), dtype=np.uint8)
-            ix, iy, iw, ih = int(fx)+1, int(fy)+1, int(fw)-2, int(fh)-2
+            ix, iy, iw, ih = int(fx+1), int(fy+1), int(fw)-2, int(fh)-2
             cv2.rectangle(safe_mask, (ix, iy), (ix + iw, iy + ih), 255, -1)
             
             alpha = (mask_warped.astype(np.float32) / 255.0) * (safe_mask.astype(np.float32) / 255.0)
